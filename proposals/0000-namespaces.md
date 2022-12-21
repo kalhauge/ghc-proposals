@@ -10,14 +10,12 @@ This proposal is [discussed at this pull request](https://github.com/ghc-proposa
 # Namespaces
 
 One of the pain-points for building structured, succinct, and easy to read Haskell code is name conflicts. 
-The lack of a fine-grained namespace controls lead developers to either creating many small files, unwanted type classes, or ad-hoc namespace measures as prefixing names to variable names.
+The lack of a fine-grained namespace controls lead developers to either creating many small files, unwanted type classes, or ad-hoc namespaces like prefixing names to variable names.
 
 Many prior proposals have tried to come up with a solution to this, especially [#283](https://github.com/ghc-proposals/ghc-proposals/pull/283) and [#295](https://github.com/ghc-proposals/ghc-proposals/pull/295), however they have all gone dormant.
 This proposal, is yet another try.
-Contrary to the previous approaches, this proposal does not want to change the module system, but instead introduce a new construct: the namespace.
-A namespace is a entity which captures the names of other entities (data types, types, and classes), so that they can easily be exported and referenced at will. 
-This proposal also introduces using another access qualifier for
-namespaces to differentiate them from modules (`:`).
+Contrary to the previous approaches, this proposal does not want to change the module system, but instead associate namespaces with all entities.
+This proposal also introduces using an access qualifier for namespaces which is different from modules (`#`); this is done to allow for incremental adoption.
 
 ## Motivation
 
@@ -56,199 +54,457 @@ or type classes named the same, you have one of three options:
     b) With suffix notation is hard to discover the abilities of a types using an IDE, e.g., 
        typing `pretty` will yield `{prettyExpr, prettyType, prettyVar}`, but typing 
        `Expr:` could yield `{Expr:pretty, Expr:evaluate, Expr:normalize, ...}`.
-    
+  
     c) The trick does not work for operators.
 
-The rest of the motivation is a list of examples mirroring [#283](https://github.com/ghc-proposals/ghc-proposals/pull/283)
+To understand the problem and the suggested solution, we'll introduce the concepts and syntax one at a time.
+Every concept builds on top of the previous, which means that the proposal could be accepted up to 
+every point and would probably be an improvement. (**WARNING** the syntax changes during the exploration, 
+so please read it step by step.)
 
-### Example 1: Compact code
+### A limiting module
 
-If we want associate the same named function with two data structures, we'll have 
-to create two files, create a type class, or prefix the names of the function.
+The first thing we would want is a way to declare types and functions without it bleeding out into the
+rest of the file. Now we can write something like this:
+```haskell
+module Top where
 
-With namespaces you can write this:
+module where
+  import Data.Set
+  setempty = empty; -- Set.empty
 
+module where
+  import Data.Map
+  mapempty = empty; -- Map.empty
+
+-- Out here mapempty and setempty is in scope, but not Data.Set and Data.Map
+```
+
+This would be a way to limit the scope of imports. This could improve some code and keep imports 
+closer to their use points. For example the pretty printing of an expression could import the 
+pretty printing local to modules.
+
+```haskell
+module where 
+  import Pretty.Printer
+  ppExpr :: ..
+```
+
+### Allowing exports
+
+We can take this idea a step further, by allowing the module to limit it's exports.
+We can use the standard export mechanism for this.
+
+```haskell
+module Top where
+
+module (range) where
+  range :: Ord i => [i] -> Maybe (i, i)
+  range = from . foldMap to
+
+  import Data.Monoid (Min(..), Max(..))
+
+  type Range i = Maybe (Min i, Max i)
+
+  to :: Ord i => i -> Range i 
+  to i = Just (Min i, Max i)
+
+  from :: Range i -> Maybe (i, i)
+  from (Just (mn, mx)) = Just (getMin mn, getMax mx)
+  from (Nothing) = Nothing
+
+solution = range [1, 2, 41, 2, (-3)]
+```
+Out here `range` is in scope but not `Range`, `Mk`, `to` or `from`. 
+This is nice because now we can have local names for things that is 
+obvious in context, but should not pollute the rest of the scope.
+
+### Very local modules 
+
+This go a step further; because when we first introduce these local modules 
+we would like to import them qualified. We borrow the 
+notation (`module qualified A where ...`) from [#283](https://github.com/ghc-proposals/ghc-proposals/pull/283).
+This allows for the collection of names in namespaces. 
+We like this because besides not polluting the file namespace it allows us to do
+different design patterns.
+For example, we can have multiple implementation of the same functionality.
+This, for example, makes sense with benchmarking:
+```haskell
+module Counter where
+
+module qualified SetCounter where
+  import Data.Set 
+  countUnique :: Ord a => [a] -> Int
+  countUnique = size . fromList
+
+module qualified HashCounter where
+  import Data.HashSet 
+  countUnique :: Hashable a => [a] -> Int
+  countUnique = size . fromList
+
+bench = defaultMain [
+  bgroup "count" 
+    [ bench "hashset" $ whnf HashCounter.countUnique [1,2,3,4]
+    , bench "set" $ whnf SetCounter.countUnique [1,2,3,4]
+    ]
+  ]
+```
+
+We could of course put `SetCounter` and `HashCounter` in different files,
+but that has drawbacks like requiring the developer to move between files, 
+and there are corner cases where the modules depend on each other.
+
+We could also name `SetCounter.countUnqiue` as `countUnqiueSetCounter`, and 
+`HashCounter.countUnique` as `countUniqueHashCounter`. 
+This is just a poor-mans ad-hoc name spacing: 
+It does not work for operators and it makes hard to give good tooling feedback in 
+IDEs.
+
+Finally, we could use type classes for some of these cases; but that is not really 
+what type classes are meant for. Type classes are supposed to describe similar traits between
+data types, not have different traits with the same name.
+
+Qualified modules are a great way of differentiating constructors and 
+field accessors. Other language extensions simply hide them.
+Another example would be:
 ```haskell
 module Vec where
 
-namespace V2 where
+module qualified V2 where
   data V2 = Mk { x :: Int, y :: Int }
-  fromV2 :: V2 -> V2
 
-namespace V3 where
+module qualified V3 where
   data V3 = Mk { x :: Int, y :: Int, z :: Int }
-  fromV2 :: V2:V2 -> Int -> V3
 
--- Creates the vector (V3:Mk 0 1 1) 
-vec_0_1_1 :: V3:V3
-vec_0_1_1 = V3:fromV2 (V2:fromV2 (V2:Mk 0 1)) 1
+v3FromV2 :: V2.V2 -> Int -> V3.V3
+v3FromV2 v2 tz = V3.Mk (V2.x v2) (V2.y y) tz 
 ```
 
-This example creates two namespaces to contain the V2 and V3 data structures, 
-their field accessors, constructors, and their
-associated functions `fromV2`. 
-We can access the inners of `V2` and `V3` using the namespace operator, `:`, 
-this means that `V2:fromV2` points to the `fromV2` function in `V2`.
+### The perils of Exporting and Importing Modules
+The example above have a huge disadvantage, though.
+You can not export or import sub-modules. This is problematic, 
+because you would expect to be able to talk about `Vec.V2` and `Vec.V3` 
+from outside of `Vec`.
 
-This illustrates a common problem that you cannot easily fix with type classes, multiple functions
-with the same name, but different arguments. I that case you have to use adhoc-namespaces:
-
+We could export a module like this (also from #283):
 ```haskell
-module Vec where
-
-data V2 = MkV2 { v3x :: Int, v3y :: Int }
-fromV2V2 :: V2 -> V2
-
-data V3 = MkV3 { v3x :: Int, v3y :: Int, v3z :: Int }
-fromV2V3 :: V2 -> Int -> V3
-
-vec_0_1_1 :: V3
-vec_0_1_1 = fromV2V3 (fromV2V2 (MkV2 0 1)) 1
+module Vec (module qualified V2, module qualified V3)
 ```
-
-Or split it over multiple files:
-
+However, importing is different. One seemingly obvious way would be to use the same syntax
+as with normal modules:
 ```haskell
--- src/Vec/V2.hs
-module Vec.V2 where
-data V2 = Mk { x :: Int, y :: Int }
-fromV2 :: V2 -> V2
+import A.B.C (fn)
 ```
-
+However, now we have a problem. What does it mean? 
+Following the Haskell approach to quantification
+we are importing the both the file `A/B/C.hs`, and importing the 
+`C` sub-module in the file `A/B.hs`, and the sub-modules `B.C` in `A.hs`.
+Furthermore, `A.hs` might quantify another file `Q.hs` as `B.C`, and 
+export that. So to figure out what `fn` is we have to look through four files.
+Another problem is that we can now change the meaning of imports:
 ```haskell
--- src/Vec/V3.hs
-module Vec.V3 where
-import Vec.V2 qualified as V2
-data V3 = Mk { x :: Int, y :: Int, z :: Int }
-fromV2 :: V2.V2 -> Int -> V3
+import qualified A.B.C as A.B
+import A.B.C (fn)
 ```
-
+Should this import the function `fn` from `A.B.C.C`, and 
+should the order of imports matter?
 ```haskell
--- src/Vec.hs
-module Vec where
-import Vec.V2 qualified as V2
-import Vec.V3 qualified as V3
-
-vec_0_1_1 :: V3.V3
-vec_0_1_1 = V3.fromV2 (V2.fromV2 (V2.Mk 0 1)) 1
+import A.B.C (fn)
+import qualified A.B.C as A.B
 ```
-
-However, in the last case you can't write a function `fromV3` in `Vec.V2`
-directly as it would create a cyclic dependency. In this case you would have 
-to follow [5.8.10](https://downloads.haskell.org/ghc/latest/docs/users_guide/separate_compilation.html#how-to-compile-mutually-recursive-modules) in the user guide; create a `hs-boot` file for `Vec.V3`, containing only 
-the datatype `V3` and written in a subset of Haskell; then you would have to import
-it using the `{#- SOURCE #-}` pragma. Needless to say this is a little complicated.
-
-### Example 2: Associated Functions
-
-By using namespaces, we can associate specific functions with the data it operates
-on. The `= Set` notation means that, the namespace `Set` will act like the entity `Set` when not used as a qualifier, e.g., `Set:a`.
-
+We can probably work around this by introducing rules that require that a prefix 
+of an import should be a real module, however this seems ad-hoc and would be 
+confusing to new comers. Also why can we requalify and open a submodule only on import from 
+another module?
+Also since there is no way to differentiate modules and submodules, we could create cyclic dependencies on ourselves if we import a module from a subfolder:
 ```haskell
--- in Data/Set.hs
-module Data.Set (Set) where
-
-namespace Set = Set (Set, fromList) where
-  data Set = ..
-
-  fromList :: [a] -> Set a
-  fromList = ... 
-
--- in Main.hs
-import Data.Set (Set)
-
-mySet :: Set String
-mySet = Set:fromList ["A", "B"]
-```
-
-Using the `namespace Set = Set` notation is done to enable users to use the common Haskell
-pattern. 
-```haskell
-import Data.Set (Set)
-import qualified Data.Set as Set
-```
-Furthermore, it enables a straight forward syntactic description of turning all entities 
-into namespaces, see the `-XAutoNamespaces` extension.
-
-### Example 3: MyPrelude
-
-By using namespaces, we can collect names used often in a prelude and export them qualified.
-
-```haskell
--- In MyPrelude.hs
-module MyPrelude ( BL, BS ) where
-
-import namespace Data.ByteString.Lazy as BL
-import namespace Data.ByteString as BS
-
--- In Lib.hs
-module Lib where
-
-import MyPrelude (BL)
-
-toByteString :: Bool -> BL:ByteString
-toByteString b = case b of
-  True -> pack "True"
-  False -> pack "False"
-  where open BL (pack)
-```
-
-Also using the Hedgehog library could look like:
-```haskell
-module Spec where
-
-import Hedgehog (forAll, Gen, Range)
-```
-
-### Example 4: Local Data Types
-
-We can declare data types locally to a function without polluting the namespace.
-
-```haskell
-module Spec where
-
-namespace (f) where
-  f = get . foldMap Mk
-  data Collection = Mk { get :: ... }
-```
-
-### Example 5: Local imports and sane operators
-
-It's often the case that we want to reuse operators
-but overloading a common used operator, 
-requires the user to either not use the other operator or import one 
-of them qualified. This is especially awkward with operators.
-
-Example, `FilePath` uses the `</>` operator to avoid classes with the standard library, 
-but if we have namespaces it could use `/`:
-
-```haskell
-import namespace System.FilePath 
-
-main = do 
-  write path (show ( 1.0 / 2.0 :: Float))
- where
-  path = "my" / "interesting" / "half.txt"
-   where open FilePath ((/))
-```
-
-Another good example is the `lens` library. When importing lens, we have to import 
-it unqualified to use the operators, but not all code needs 
-all the operators:
-
-```haskell
-import namespace Control.Lens 
-
-nonLensCode = do 
-  --- this code can use ^. for other things.
+-- A/B.hs
+module A.B where
+  ..
+-- A.hs
+module A where
+import qualified A.B as AB -- A cyclic dependency on A?
+module B where
   ...
+```
+This also means that import `A.B` we have to import `A` as well.
+This is also problematic because it brings any instance defined in `A` into scope.
 
-lensCode = do 
-  name .= "hello"
- where
-  open Lens
+The solution from [#283](https://github.com/ghc-proposals/ghc-proposals/pull/283) is to not
+allow local modules to be imported through the normal system, instead you have to import them 
+as sub modules:
+```haskell
+-- A/B.hs
+import A (module C)
+```
+This however demotes sub-modules to pseudo modules, which are similar but not quite modules.
+Proposal [#295](https://github.com/ghc-proposals/ghc-proposals/pull/295) tried to fix this 
+but ran into many of the problems listed above.
+Proposal #283 also has other issues which come down to that you suddenly can extend [a
+module](https://github.com/ghc-proposals/ghc-proposals/pull/283#issuecomment-974382367).
+
+All of this points to the same problem: a module is currently doing to many things. It is both a file, 
+a compilation unit, and by accident a namespace. 
+
+### The solution: Associated Namespaces
+
+To solve this we associate namespaces with type-level entities instead of modules. 
+A type-level entity is a type, a newtype, a class or a datatype.
+In contrast to a module, an entity is not tied 
+to a file. This allows it to be more flexible. The downside is that we have to introduce 
+some new syntax to differentiate between them.
+First we add a `where` clauses to the end of `type`, we also allow the type construct to alias to nothing. 
+
+It might seem odd to overload `type` like this, but this is pretty normal.
+It is for example used for naming constraints in `ConstraintKinds`.
+So `type` should more be read as: at the type level name this thing that, than as defining a
+new type.
+
+Now we claim that `type N (..) [qualified] where ..` is roughly equivalent to `module [qualified] N (..) where ..` from before but instead of creating a new name in the module space it associates the namespace with the type `N`.
+This means that importing and exporting namespaces is straight forward.
+```haskell
+-- in A.hs
+module A (B(..)) where
+type B where
+  type C where
+    x = 0 
+-- in Main.hs
+import A (B) -- B is now is scope
+import A (B(C)) -- C is now is scope
+import A (B(C(x))) -- x is now is scope
 ```
 
+Another piece of syntax we need is the ability to access names inside of a namespace.
+This is why we have to introduce a new magic operator: `#`. E.g., `Vec#V2`.
+We differentiate between `Vec#V2` and `Vec # V2` in the same way we differentiate 
+between `Vec.V2` and `Vec . V2`.
+We choose `#` because it already used as a magic operator, in `CPP` and in `MagicHash`
+but never between words.
+This should give the maximal backward compatibility.
+**The choice of this operator is not final, as it have some drawbacks, see discussion**.
+Besides differentiating between namespace lookup and module lookup, it also
+makes namespace lookup look different than function composition (and possible dot record lookup).
+It is also a normal distinction to make in other languages.
+
+Of course, a type alias is still a type alias, so we can write something like this:
+```haskell
+type Set = Set qualified where
+  data Set a = ...
+  fromList = ..
+
+fn :: [a] -> Set a -- the namespace Set points to the type constructor Set (also named Set:Set)
+fn = Set#fromList 
+```
+
+A type might have type variables associated with them, lookup is then done over the type constructor.
+```haskell
+type L a b = X b a where
+  -- a is not in scope here so in has to be introduced.
+  type X a = a
+
+thesame :: L#X b a -> L a b
+thesame = id
+```
+
+Since namespaces are associated with all entities we get:
+```haskell
+data Nat = Succ Nat | Zero
+-- same as
+type Nat = Nat where -- here the type alias takes precedence and hides Nat
+  data Nat = Succ Nat | Zero
+
+-- Used like
+zero :: Nat
+zero = Nat#Succ Nat#Zero
+-- or like this (since Nat is not qualified)
+zero = Succ Zero
+
+-- Also works for data classes
+class Functor f where 
+  fmap :: (a -> b) -> f a -> f b
+
+mapThis = Functor#fmap (+1) [1,2,3]
+```
+
+Our example from above now looks like this:
+```haskell
+module Vec where
+
+data V2 = Mk { x :: Int, y :: Int }
+data V3 = Mk { x :: Int, y :: Int, z :: Int }
+
+v3FromV2 :: V2 -> Int -> V3
+v3FromV2 v2 tz = V3#Mk (V2#x v2) (V2#y v) tz
+```
+
+This is the core of the proposal.
+At this point we expect maximal backward compatibility with most bang for your buck.
+The only breaking change is requiring developers to put spaces around `#`, which 
+they probably are already doing.
+
+### (Optional) Opening namespaces
+
+Since namespaces are now much more flexible, we do not have to open them 
+in the top of a file.
+
+Instead, we can introduce a special declaration: `open`. 
+This declaration is essentially equivalent to redeclaring everything
+from the namespace into the other.
+```haskell
+-- this can also be done on the top level:
+open Set (fromList)
+-- same as
+fromList = Set#fromList
+
+-- In a where clause
+unique = size . fromList 
+ where open Set (size, fromList)
+-- same as
+unique = size . fromList 
+ where 
+  fromList = Set#fromList
+  size = Set#size
+
+ -- In an expression
+unique =
+  open Set (size, fromList) 
+  in size . fromList 
+-- same as
+unique = 
+  let open Set (size, fromList) 
+  in size . fromList 
+-- same as
+unique = 
+  let 
+    size = Set#size
+    fromList = Set#fromList
+  in size . fromList
+
+-- or in a do binding
+function = do
+  open Set (fromList)
+  ...
+-- same as
+function = do
+  let open Set (fromList)
+  ...
+-- same as
+function = do
+  let fromList = Set#fromList
+  ...
+```
+
+The downsides to this extension is that you get less traceability in your code.
+It might be unclear from where the `fromList` came from, especially if opened 
+without restrictions: `open Set`.
+Furthermore you also introduce a new keyword, which means that you can no longer use `open`
+as a variable.
+
+It is also extremely useful when importing operators as you normally do not 
+want those qualified:
+```haskell
+type Lens where import Data.Lens
+access = entry ^. lastAcesssTime
+  where open Lens
+```
+
+We could also open namespaces in type annotations, however there is no
+good syntax for defining types in annotations yet. Instead, we can use 
+the empty namespace:
+```haskell
+type _ (getSomething) where 
+  open Containers (Map)
+  getSomething :: Monoid m => Map m y -> y
+```
+
+### (Optional) `-XAutoQualified`
+
+Ideally all namespaces should be qualified, but this breaks backward compatibility.
+By enabling an extension `-XAutoQualified` all entities become qualified.
+```haskell
+data V2 = Mk { x :: Int, y :: Int } 
+-- becomes
+data V2 = Mk { x :: Int, y :: Int } qualified
+
+-- x is no longer in scope but V2:x is.
+```
+
+### (Optional) Associated types, patterns, and functions
+
+We could also associate types and functions with 
+data constructors:
+```haskell
+data V2 = Mk { x :: Int, y :: Int } where
+  pattern Origon = Mk 0 0
+
+
+access = V2:Origon
+```
+And the same syntax is used for `GADTs`. 
+```haskell
+data V2 where
+  Mk :: Int -> Int -> V2
+  pattern Origon = Mk 0 0  -- Clearly not a constructor.
+access = V2:Origon
+```
+
+### (Optional) `-XAmbiguousNamespaces`
+
+One might think that we can use the `.` operator for 
+accessing namespaces, however it does introduce alot of 
+ambiguity:
+```haskell
+import Data.Set as Set
+import MyPrelude (Set)
+myFromList = Set.fromList
+```
+In this case there is no way for the compiler to know if you meant to lookup `fromList` in 
+the namespace `Set` or in the module `Set`.
+We could throw an error if we get an ambiguity, but that might break existing code.
+This can therefore not be included in the main code, instead it will be available as 
+an extension.
+Using this extension you can use `.` instead of `#` names with all the problems that 
+might entail. 
+
+With this extension on the running example would look like this:
+```haskell
+module Vec where
+
+data V2 = Mk { x :: Int, y :: Int }
+data V3 = Mk { x :: Int, y :: Int, z :: Int }
+
+v3FromV2 :: V2 -> Int -> V3
+v3FromV2 v2 tz = V3.Mk (V2.x v2) (V2.y v) tz
+```
+
+We do not recommend using this extension, because it will make code harder to read. 
+Especially because entity namespaces do not behave in the same way module namespaces behave.
+While it is okay to have two overlapping modules, it is not okay to have two overlapping 
+entities.
+```haskell
+import Data.ByteString.Lazy as BL
+import Data.ByteString.Lazy.IO as BL
+
+-- This is fine:
+main = ..  BL.read
+
+-- But ...
+
+type BL where import Data.ByteString.Lazy 
+type BL where import Data.ByteString.Lazy.IO
+
+-- This is not fine (BL could refere to any of the BL types)
+main = ..  BL.read
+
+-- But ..
+
+type BL where 
+  import Data.ByteString.Lazy 
+  import Data.ByteString.Lazy.IO
+
+-- This is fine again.
+main = ..  BL.read
+```
 
 ## Proposed Change Specification
 
@@ -793,4 +1049,197 @@ It is not mandatory for have any endorsements at all, but the more substantial
 the proposal is, the more desirable it is to offer evidence that there is
 significant demand from the community.  This section is one way to provide
 such evidence.
+
+
+## Other Examples
+
+The rest of the motivation is a list of examples mirroring [#283](https://github.com/ghc-proposals/ghc-proposals/pull/283)
+
+### Example 1: Compact code
+
+If we want associate the same named function with two data structures, we'll have 
+to create two files, create a type class, or prefix the names of the function.
+
+With namespaces you can write this:
+
+```haskell
+module Vec where
+
+namespace V2 where
+  data V2 = Mk { x :: Int, y :: Int }
+  fromV2 :: V2 -> V2
+
+namespace V3 where
+  data V3 = Mk { x :: Int, y :: Int, z :: Int }
+  fromV2 :: V2:V2 -> Int -> V3
+
+-- Creates the vector (V3:Mk 0 1 1) 
+vec_0_1_1 :: V3:V3
+vec_0_1_1 = V3:fromV2 (V2:fromV2 (V2:Mk 0 1)) 1
+```
+
+This example creates two namespaces to contain the V2 and V3 data structures, 
+their field accessors, constructors, and their
+associated functions `fromV2`. 
+We can access the inners of `V2` and `V3` using the namespace operator, `:`, 
+this means that `V2:fromV2` points to the `fromV2` function in `V2`.
+
+This illustrates a common problem that you cannot easily fix with type classes, multiple functions
+with the same name, but different arguments. I that case you have to use adhoc-namespaces:
+
+```haskell
+module Vec where
+
+data V2 = MkV2 { v3x :: Int, v3y :: Int }
+fromV2V2 :: V2 -> V2
+
+data V3 = MkV3 { v3x :: Int, v3y :: Int, v3z :: Int }
+fromV2V3 :: V2 -> Int -> V3
+
+vec_0_1_1 :: V3
+vec_0_1_1 = fromV2V3 (fromV2V2 (MkV2 0 1)) 1
+```
+
+Or split it over multiple files:
+
+```haskell
+-- src/Vec/V2.hs
+module Vec.V2 where
+data V2 = Mk { x :: Int, y :: Int }
+fromV2 :: V2 -> V2
+```
+
+```haskell
+-- src/Vec/V3.hs
+module Vec.V3 where
+import Vec.V2 qualified as V2
+data V3 = Mk { x :: Int, y :: Int, z :: Int }
+fromV2 :: V2.V2 -> Int -> V3
+```
+
+```haskell
+-- src/Vec.hs
+module Vec where
+import Vec.V2 qualified as V2
+import Vec.V3 qualified as V3
+
+vec_0_1_1 :: V3.V3
+vec_0_1_1 = V3.fromV2 (V2.fromV2 (V2.Mk 0 1)) 1
+```
+
+However, in the last case you can't write a function `fromV3` in `Vec.V2`
+directly as it would create a cyclic dependency. In this case you would have 
+to follow [5.8.10](https://downloads.haskell.org/ghc/latest/docs/users_guide/separate_compilation.html#how-to-compile-mutually-recursive-modules) in the user guide; create a `hs-boot` file for `Vec.V3`, containing only 
+the datatype `V3` and written in a subset of Haskell; then you would have to import
+it using the `{#- SOURCE #-}` pragma. Needless to say this is a little complicated.
+
+### Example 2: Associated Functions
+
+By using namespaces, we can associate specific functions with the data it operates
+on. The `= Set` notation means that, the namespace `Set` will act like the entity `Set` when not used as a qualifier, e.g., `Set:a`.
+
+```haskell
+-- in Data/Set.hs
+module Data.Set (Set) where
+
+namespace Set = Set (Set, fromList) where
+  data Set = ..
+
+  fromList :: [a] -> Set a
+  fromList = ... 
+
+-- in Main.hs
+import Data.Set (Set)
+
+mySet :: Set String
+mySet = Set:fromList ["A", "B"]
+```
+
+Using the `namespace Set = Set` notation is done to enable users to use the common Haskell
+pattern. 
+```haskell
+import Data.Set (Set)
+import qualified Data.Set as Set
+```
+Furthermore, it enables a straight forward syntactic description of turning all entities 
+into namespaces, see the `-XAutoNamespaces` extension.
+
+### Example 3: MyPrelude
+
+By using namespaces, we can collect names used often in a prelude and export them qualified.
+
+```haskell
+-- In MyPrelude.hs
+module MyPrelude ( BL, BS ) where
+
+import namespace Data.ByteString.Lazy as BL
+import namespace Data.ByteString as BS
+
+-- In Lib.hs
+module Lib where
+
+import MyPrelude (BL)
+
+toByteString :: Bool -> BL:ByteString
+toByteString b = case b of
+  True -> pack "True"
+  False -> pack "False"
+  where open BL (pack)
+```
+
+Also using the Hedgehog library could look like:
+```haskell
+module Spec where
+
+import Hedgehog (forAll, Gen, Range)
+```
+
+### Example 4: Local Data Types
+
+We can declare data types locally to a function without polluting the namespace.
+
+```haskell
+module Spec where
+
+namespace (f) where
+  f = get . foldMap Mk
+  data Collection = Mk { get :: ... }
+```
+
+### Example 5: Local imports and sane operators
+
+It's often the case that we want to reuse operators
+but overloading a common used operator, 
+requires the user to either not use the other operator or import one 
+of them qualified. This is especially awkward with operators.
+
+Example, `FilePath` uses the `</>` operator to avoid classes with the standard library, 
+but if we have namespaces it could use `/`:
+
+```haskell
+import namespace System.FilePath 
+
+main = do 
+  write path (show ( 1.0 / 2.0 :: Float))
+ where
+  path = "my" / "interesting" / "half.txt"
+   where open FilePath ((/))
+```
+
+Another good example is the `lens` library. When importing lens, we have to import 
+it unqualified to use the operators, but not all code needs 
+all the operators:
+
+```haskell
+import namespace Control.Lens 
+
+nonLensCode = do 
+  --- this code can use ^. for other things.
+  ...
+
+lensCode = do 
+  name .= "hello"
+ where
+  open Lens
+```
 

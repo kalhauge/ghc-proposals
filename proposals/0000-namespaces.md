@@ -100,18 +100,18 @@ module Top where
 
 module (range) where
   range :: Ord i => [i] -> Maybe (i, i)
-  range = from . foldMap to
+  range = to . foldMap from
 
   import Data.Monoid (Min(..), Max(..))
 
   type Range i = Maybe (Min i, Max i)
 
-  to :: Ord i => i -> Range i 
-  to i = Just (Min i, Max i)
+  from :: Ord i => i -> Range i 
+  from i = Just (Min i, Max i)
 
-  from :: Range i -> Maybe (i, i)
-  from (Just (mn, mx)) = Just (getMin mn, getMax mx)
-  from (Nothing) = Nothing
+  to :: Range i -> Maybe (i, i)
+  to (Just (mn, mx)) = Just (getMin mn, getMax mx)
+  to (Nothing) = Nothing
 
 solution = range [1, 2, 41, 2, (-3)]
 ```
@@ -180,6 +180,10 @@ v3FromV2 :: V2.V2 -> Int -> V3.V3
 v3FromV2 v2 tz = V3.Mk (V2.x v2) (V2.y y) tz 
 ```
 
+At this point we have introduced nothing that seriously break anything. 
+We could imagine this functionality being enabled under a language 
+extension: `-XLocalModules`.
+
 ### The perils of Exporting and Importing Modules
 The example above have a huge disadvantage, though.
 You can not export or import sub-modules. This is problematic, 
@@ -246,7 +250,7 @@ module](https://github.com/ghc-proposals/ghc-proposals/pull/283#issuecomment-974
 All of this points to the same problem: a module is currently doing to many things. It is both a file, 
 a compilation unit, and by accident a namespace. 
 
-### The solution: Associated Namespaces
+### The solution: Associated Namespaces (`-XNamespaces`)
 
 To solve this we associate namespaces with type-level entities instead of modules. 
 A type-level entity is a type, a newtype, a class or a datatype.
@@ -258,7 +262,8 @@ First we add a `where` clauses to the end of `type`, we also allow the type cons
 It might seem odd to overload `type` like this, but this is pretty normal.
 It is for example used for naming constraints in `ConstraintKinds`.
 So `type` should more be read as: at the type level name this thing that, than as defining a
-new type.
+new type. It's therefore relatively easy to imagine that you can extend this notion to work
+with namespaces as well.
 
 Now we claim that `type N (..) [qualified] where ..` is roughly equivalent to `module [qualified] N (..) where ..` from before but instead of creating a new name in the module space it associates the namespace with the type `N`.
 This means that importing and exporting namespaces is straight forward.
@@ -292,7 +297,7 @@ type Set = Set qualified where
   data Set a = ...
   fromList = ..
 
-fn :: [a] -> Set a -- the namespace Set points to the type constructor Set (also named Set:Set)
+fn :: [a] -> Set a -- the namespace Set points to the type constructor Set (also named Set#Set)
 fn = Set#fromList 
 ```
 
@@ -306,7 +311,8 @@ thesame :: L#X b a -> L a b
 thesame = id
 ```
 
-Since namespaces are associated with all entities we get:
+Namespaces are associated with all type-level entities, this is super 
+help full as we can be very precise what constructor we want.
 ```haskell
 data Nat = Succ Nat | Zero
 -- same as
@@ -324,6 +330,11 @@ class Functor f where
   fmap :: (a -> b) -> f a -> f b
 
 mapThis = Functor#fmap (+1) [1,2,3]
+
+-- and for newtypes
+newtype Counter a = W { unwrap :: State Int a }
+count = runState . Counter#unwrap $ do
+  ...
 ```
 
 Our example from above now looks like this:
@@ -340,9 +351,9 @@ v3FromV2 v2 tz = V3#Mk (V2#x v2) (V2#y v) tz
 This is the core of the proposal.
 At this point we expect maximal backward compatibility with most bang for your buck.
 The only breaking change is requiring developers to put spaces around `#`, which 
-they probably are already doing.
+they probably are already doing because of the other extensions.
 
-### (Optional) Opening namespaces
+### (Optional) Opening namespaces `-XNamespaceOpen` (implies `-XNamespaces`)
 
 Since namespaces are now much more flexible, we do not have to open them 
 in the top of a file.
@@ -410,33 +421,32 @@ access = entry ^. lastAcesssTime
 
 We could also open namespaces in type annotations, however there is no
 good syntax for defining types in annotations yet. Instead, we can use 
-the empty namespace:
+the module limiting namespace:
 ```haskell
-type _ (getSomething) where 
+module (getSomething) where 
   open Containers (Map)
   getSomething :: Monoid m => Map m y -> y
 ```
 
-### (Optional) `-XAutoQualified`
+### (Optional) `-XAutoQualified` (implies `-XNamespaces`)
 
-Ideally all namespaces should be qualified, but this breaks backward compatibility.
+Ideally, all namespaces should be qualified, but this breaks backward compatibility.
 By enabling an extension `-XAutoQualified` all entities become qualified.
 ```haskell
 data V2 = Mk { x :: Int, y :: Int } 
 -- becomes
 data V2 = Mk { x :: Int, y :: Int } qualified
 
--- x is no longer in scope but V2:x is.
+-- x is no longer in scope but V2#x is.
 ```
 
-### (Optional) Associated types, patterns, and functions
+### (Optional) Associated types, patterns, and functions (possible part of `-XNamespaces`)
 
 We could also associate types and functions with 
-data constructors:
+data constructors, like this:
 ```haskell
 data V2 = Mk { x :: Int, y :: Int } where
   pattern Origon = Mk 0 0
-
 
 access = V2:Origon
 ```
@@ -447,8 +457,29 @@ data V2 where
   pattern Origon = Mk 0 0  -- Clearly not a constructor.
 access = V2:Origon
 ```
+This is also super useful for newtypes, which are often 
+created to define new functionality to old types.
+Our range example, could look like this instead.
 
-### (Optional) `-XAmbiguousNamespaces`
+```haskell
+range :: Ord i => [i] -> Maybe (i, i)
+range = fmap Range#toTuple . Range#fromList
+
+newtype Range i = W { toTuple :: (i, i) } 
+  deriving (Semigroup) via (T i)
+ qualified where
+  import Data.Monoid (Min(..), Max(..))
+  type T i = (Min i, Max i)
+
+  fromList :: Ord i => [i] -> Maybe (Range i)
+  fromList = foldMap (Just . singleton)
+
+  singleton :: Ord i => i -> Range i 
+  singleton i = (Min i, Max i)
+```
+
+
+### (Optional) `-XAmbiguousNamespaces` (implies `-XNamespaces`)
 
 One might think that we can use the `.` operator for 
 accessing namespaces, however it does introduce alot of 
@@ -505,6 +536,58 @@ type BL where
 -- This is fine again.
 main = ..  BL.read
 ```
+
+It might also create uncertainty about what is exported from a module;
+since only entity namespaces are exported.
+
+```haskell
+-- in file A/B.hs
+module A.B where
+  y = 0
+
+-- in file A.hs
+module A (B) where
+import qualified A.B as B
+type B where
+  x = 1
+
+expr = print B.y -- Okay as y is defined in A.B
+
+-- in file C.hs
+module C where
+import A (B)
+
+expr = print B.y -- Not okay as B only contain x.
+
+-- in file D.hs
+module D where
+import A.B as B
+
+expr = print B.x -- Not okay as B only contain y.
+```
+
+### (Optional) The endgame? `-XNoModuleNamespaces` (implies `-XAmbiguousNamespaces`)
+
+The solution to this is to disallow module namespaces. 
+We could imagine a simple extension that simply removes all module namespaces.
+```haskell
+import A.B -- Okay, imports everything in the current namespace.
+z = A.B.x -- Not legal, since A.B is not a qualifier.
+--
+import A.B as B -- Not legal, since it makes no sense.
+import A.B qualified as B -- Also not legal, since it makes no sense.
+
+-- To import qualified, create a new entity namespace, 
+-- and import the module in there.
+type A where 
+  type B where import A.B
+z = A.B.x -- Very legal :)
+z = A#B#x -- Also, still legal.
+```
+
+Now, because there are no conflicts with the module namespaces, we can relatively safely
+and with minimal confusion use the dot operator for entity namespaces. 
+There might still be conflicts with the `OverloadedRecordDot`, but we can't get everything.
 
 ## Proposed Change Specification
 
